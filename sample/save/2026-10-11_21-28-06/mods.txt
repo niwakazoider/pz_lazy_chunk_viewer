@@ -1,0 +1,11 @@
+VERSION = 1,
+
+mods
+{
+    mod = GojulasBoxMod,
+    mod = SalamanderBoxMod,
+}
+
+maps
+{
+}

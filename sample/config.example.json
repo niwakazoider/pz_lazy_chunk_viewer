@@ -1,0 +1,20 @@
+{
+  "_comment_media_root": "ProjectZomboid/media フォルダ。例 D:/Steam/steamapps/common/ProjectZomboid/media",
+  "media_root": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\ProjectZomboid\\media",
+  "_comment_map_root": ".lotheader と world_*.lotpack が入っている親フォルダ。再帰検索します。",
+  "map_root": "C:\\Program Files (x86)\\Steam\\steamapps\\common\\ProjectZomboid\\media\\maps",
+  "_comment_save_root": "セーブのルート。配下に map/X/Y.bin がある場所。",
+  "save_root": "C:/Users/test/Zomboid/Saves/Sandbox/2026-10-11_21-28-06",
+  "_comment_pack_index": "scan_pz_media.py で生成した pack_entries.csv",
+  "pack_index_csv": "D:/pz_media_index/pack_entries.csv",
+  "host": "127.0.0.1",
+  "port": 8765,
+  "start_chunk_x": 1329,
+  "start_chunk_y": 1300,
+  "start_z": 0,
+  "prefetch_radius": 1,
+  "max_request_radius": 3,
+  "save_world_version": 249,
+  "start_at_player": true,
+  "player_username": ""
+}
