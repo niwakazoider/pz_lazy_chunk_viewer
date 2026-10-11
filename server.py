@@ -774,6 +774,11 @@ def parse_save_chunk(chunk_x: int, chunk_y: int):
                         continue
 
                     sid = int(base.sprite_id)
+                    try:
+                        sid = int(base.sprite_id)
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+
                     name = SPRITE_IDS.main_name(sid)
                     objects.append(
                         {
