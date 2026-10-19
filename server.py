@@ -43,9 +43,18 @@ from typing import Optional
 
 from PIL import Image
 
-HERE = Path(__file__).resolve().parent
-VENDOR = HERE / "vendor"
-sys.path.insert(0, str(VENDOR))
+# Runtime paths: bundled resources vs user-writable files.
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    RESOURCE_DIR = Path(sys._MEIPASS).resolve()
+    EXE_DIR = Path(sys.executable).resolve().parent
+else:
+    RESOURCE_DIR = Path(__file__).resolve().parent
+    EXE_DIR = RESOURCE_DIR
+
+HERE = RESOURCE_DIR
+VENDOR = RESOURCE_DIR / "vendor"
+if str(VENDOR) not in sys.path:
+    sys.path.insert(0, str(VENDOR))
 
 import kaitai_mini as k  # noqa: E402
 
@@ -55,7 +64,7 @@ import kaitai_mini as k  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def load_config():
-    p = HERE / "config.json"
+    p = EXE_DIR / "config.json"
     if not p.exists():
         raise SystemExit(
             "config.json がありません。\n"
@@ -70,7 +79,7 @@ def load_config():
         "start_chunk_y": 1300,
         "start_z": 0,
         "prefetch_radius": 2,
-        "max_request_radius": 5,
+        "max_request_radius": 10,
         "save_world_version": 249,
         "start_at_player": True,
         "player_username": "",
@@ -90,7 +99,7 @@ def load_config():
 
 
 CFG = load_config()
-CACHE_ROOT = HERE / "cache"
+CACHE_ROOT = EXE_DIR / "cache"
 CACHE_ROOT.mkdir(exist_ok=True)
 
 SPEC_ROOT = VENDOR / "pzdataspec-main" / "data_spec" / "spec"
@@ -737,6 +746,95 @@ def save_chunk_path(chunk_x: int, chunk_y: int):
     return None
 
 
+
+def _as_int(value, default=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _find_iso_door_state_node(obj):
+    """
+    Find the parsed pzdataspec node that contains IsoDoor state.
+
+    The exact wrapper attribute name can differ with the schema layout, so
+    don't hard-code o.subclass_object here.  Walk already-parsed child nodes
+    and look for the fields we actually need.
+    """
+    seen = set()
+    stack = [obj]
+
+    while stack:
+        node = stack.pop()
+        node_id = id(node)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+
+        values = getattr(node, "__dict__", {})
+
+        # A door node should expose the open flag plus at least one of the
+        # explicit open/closed sprite ids.
+        if "open" in values and (
+            "open_sprite_id" in values or "closed_sprite_id" in values
+        ):
+            return node
+
+        for key, value in values.items():
+            if key.startswith("_"):
+                continue
+
+            if hasattr(value, "__dict__"):
+                stack.append(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    if hasattr(item, "__dict__"):
+                        stack.append(item)
+
+    return None
+
+
+def _door_render_state(obj, base_sid: int):
+    """
+    Return (sprite_id_to_render, door_metadata).
+
+    Falls back to base_sid if the schema/node does not expose the expected
+    IsoDoor fields, so one unusual object cannot break the whole chunk.
+    """
+    door = _find_iso_door_state_node(obj)
+    if door is None:
+        return base_sid, {
+            "state_found": False,
+            "open": None,
+            "closed_sprite_id": None,
+            "open_sprite_id": None,
+        }
+
+    open_raw = getattr(door, "open", None)
+    is_open = bool(_as_int(open_raw, 0))
+
+    closed_sid = _as_int(getattr(door, "closed_sprite_id", None))
+    open_sid = _as_int(getattr(door, "open_sprite_id", None))
+
+    render_sid = base_sid
+    if is_open and open_sid is not None:
+        render_sid = open_sid
+    elif not is_open and closed_sid is not None:
+        render_sid = closed_sid
+
+    return render_sid, {
+        "state_found": True,
+        "open": is_open,
+        "closed_sprite_id": closed_sid,
+        "open_sprite_id": open_sid,
+        "locked": bool(_as_int(getattr(door, "locked", 0), 0))
+            if hasattr(door, "locked") else None,
+        "north": bool(_as_int(getattr(door, "north", 0), 0))
+            if hasattr(door, "north") else None,
+    }
+
+
 def parse_save_chunk(chunk_x: int, chunk_y: int):
     global _SAVE_SPEC_OBJ
 
@@ -773,22 +871,38 @@ def parse_save_chunk(chunk_x: int, chunk_y: int):
                     if base is None:
                         continue
 
-                    sid = int(base.sprite_id)
                     try:
-                        sid = int(base.sprite_id)
+                        base_sid = int(base.sprite_id)
                     except (AttributeError, TypeError, ValueError):
+                        # Some serialized objects use common::empty as their
+                        # base object and therefore have no sprite_id.
+                        # Skip only that object instead of failing the chunk.
                         continue
 
+                    class_id = int(o.class_id)
+                    sid = base_sid
+                    door_meta = None
+
+                    # IsoDoor: the base sprite is not necessarily the sprite
+                    # that represents the current saved open/closed state.
+                    if class_id == 17:
+                        sid, door_meta = _door_render_state(o, base_sid)
+
                     name = SPRITE_IDS.main_name(sid)
-                    objects.append(
-                        {
-                            "class_id": int(o.class_id),
-                            "class_name": CLASS_NAMES.get(int(o.class_id), f"class_{int(o.class_id)}"),
-                            "base_type": getattr(o, "base_type", None),
-                            "sprite_id": sid,
-                            "sprite_name": name,
-                        }
-                    )
+
+                    obj_info = {
+                        "class_id": class_id,
+                        "class_name": CLASS_NAMES.get(class_id, f"class_{class_id}"),
+                        "base_type": getattr(o, "base_type", None),
+                        "base_sprite_id": base_sid,
+                        "sprite_id": sid,
+                        "sprite_name": name,
+                    }
+
+                    if door_meta is not None:
+                        obj_info["door"] = door_meta
+
+                    objects.append(obj_info)
 
                 squares.append(
                     {
@@ -841,7 +955,7 @@ def source_signature(paths):
         h.update(str(st.st_mtime_ns).encode())
         h.update(str(st.st_size).encode())
     # Rendering code version.
-    h.update(b"renderer-v1-main-sprite-no-extra")
+    h.update(b"renderer-v2-main-sprite-door-state-no-extra")
     return h.hexdigest()[:14]
 
 
@@ -895,6 +1009,57 @@ def chunk_model(chunk_x: int, chunk_y: int, z: int, mode: str):
     raise ValueError(mode)
 
 
+
+# Fixed-layout, half-resolution chunk PNG cache.
+#
+# Rendering is first done in the normal 2x PZ coordinate system on a
+# 1280x768 logical canvas (roughly an 8x8 chunk plus one floor of headroom).
+# The finished image is then downsampled to 640x384 for storage/decoding.
+# The browser draws it at 2x size, restoring the original 1280x768 world size.
+#
+# Result:
+#   cached PNG       = 640 x 384
+#   displayed size   = 1280 x 768
+#   display scale    = 2
+#   logical origin   = (640, 288)
+#   PNG origin       = (320, 144)
+#
+# All chunks use the same origin, so per-image min_x/min_y alignment data is
+# no longer required.
+CHUNK_LOGICAL_WIDTH = 1280
+CHUNK_LOGICAL_HEIGHT = 768
+CHUNK_LOGICAL_ORIGIN_X = 640
+CHUNK_LOGICAL_ORIGIN_Y = 288
+
+CHUNK_PNG_WIDTH = CHUNK_LOGICAL_WIDTH // 2
+CHUNK_PNG_HEIGHT = CHUNK_LOGICAL_HEIGHT // 2
+CHUNK_PNG_ORIGIN_X = CHUNK_LOGICAL_ORIGIN_X // 2
+CHUNK_PNG_ORIGIN_Y = CHUNK_LOGICAL_ORIGIN_Y // 2
+CHUNK_PNG_DISPLAY_SCALE = 2
+
+CHUNK_RENDER_CACHE_VERSION = "fixedpng-half-v3-door-state"
+
+
+def _alpha_composite_clipped(dst, src, x: int, y: int):
+    """Alpha-composite src onto dst, clipping cleanly at dst bounds."""
+    dw, dh = dst.size
+    sw, sh = src.size
+
+    src_l = max(0, -x)
+    src_t = max(0, -y)
+    src_r = min(sw, dw - x)
+    src_b = min(sh, dh - y)
+
+    if src_l >= src_r or src_t >= src_b:
+        return False
+
+    crop = src if (src_l == 0 and src_t == 0 and src_r == sw and src_b == sh) \
+        else src.crop((src_l, src_t, src_r, src_b))
+
+    dst.alpha_composite(crop, (x + src_l, y + src_t))
+    return (src_l != 0 or src_t != 0 or src_r != sw or src_b != sh)
+
+
 def render_chunk(chunk_x: int, chunk_y: int, z: int, mode: str):
     drawables, src_meta, source_paths = chunk_model(chunk_x, chunk_y, z, mode)
 
@@ -911,7 +1076,9 @@ def render_chunk(chunk_x: int, chunk_y: int, z: int, mode: str):
     cache_dir = CACHE_ROOT / mode / f"z{z}"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    stem = f"{chunk_x}_{chunk_y}_{sig}"
+    # Include renderer-layout version in the filename so old variable-sized
+    # PNG cache files are never mistaken for fixed-layout images.
+    stem = f"{chunk_x}_{chunk_y}_{sig}_{CHUNK_RENDER_CACHE_VERSION}"
     png_path = cache_dir / f"{stem}.png"
     meta_path = cache_dir / f"{stem}.json"
 
@@ -923,20 +1090,15 @@ def render_chunk(chunk_x: int, chunk_y: int, z: int, mode: str):
 
         drawables.sort(key=lambda t: (t[0] + t[1], t[0], t[1], t[2]))
 
-        # Always include the logical 8x8 diamond in bounds.
-        refs = []
-        for x in range(8):
-            for y in range(8):
-                bx, by = iso_base(x, y)
-                refs.extend([(bx - 64, by - 32), (bx + 64, by + 32)])
+        canvas = Image.new(
+            "RGBA",
+            (CHUNK_LOGICAL_WIDTH, CHUNK_LOGICAL_HEIGHT),
+            (0, 0, 0, 0),
+        )
 
-        min_x = min(x for x, _ in refs)
-        max_x = max(x for x, _ in refs)
-        min_y = min(y for _, y in refs)
-        max_y = max(y for _, y in refs)
-
-        placements = []
         missing = []
+        placements = []
+        clipped = []
 
         for x, y, order, name in drawables:
             spr = SPRITES.sprite(name)
@@ -946,37 +1108,39 @@ def render_chunk(chunk_x: int, chunk_y: int, z: int, mode: str):
 
             img, sm = spr
             bx, by = iso_base(x, y)
+
+            # Same logical sprite placement as before, but translated into a
+            # fixed PNG coordinate system.
             left = bx - sm["fw"] // 2 + sm["ox"]
             top = by - sm["fh"] + sm["oy"]
 
-            placements.append((left, top, img))
-            min_x = min(min_x, left)
-            min_y = min(min_y, top)
-            max_x = max(max_x, left + img.width)
-            max_y = max(max_y, top + img.height)
+            dx = int(round(CHUNK_LOGICAL_ORIGIN_X + left))
+            dy = int(round(CHUNK_LOGICAL_ORIGIN_Y + top))
+            placements.append((dx, dy, img, name))
 
-        margin = 24
-        min_x -= margin
-        min_y -= margin
-        max_x += margin
-        max_y += margin
+        for dx, dy, img, name in placements:
+            if _alpha_composite_clipped(canvas, img, dx, dy):
+                clipped.append(name)
 
-        width = max(1, int(math.ceil(max_x - min_x)))
-        height = max(1, int(math.ceil(max_y - min_y)))
+        # Store at half resolution.  PNG decoding memory becomes ~0.94 MiB
+        # per image instead of ~3.75 MiB for 1280x768, while the browser
+        # displays the image at 2x size.
+        try:
+            resample_lanczos = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample_lanczos = Image.LANCZOS
 
-        canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        png_canvas = canvas.resize(
+            (CHUNK_PNG_WIDTH, CHUNK_PNG_HEIGHT),
+            resample=resample_lanczos,
+        )
 
-        for left, top, img in placements:
-            dx = int(round(left - min_x))
-            dy = int(round(top - min_y))
-            canvas.alpha_composite(img, (dx, dy))
-
-        # Write cache atomically so clients never see a partially written PNG.
+        # Atomic write: clients never see a partially written PNG.
         tmp_png = png_path.with_name(
             png_path.name + f".tmp-{os.getpid()}-{threading.get_ident()}"
         )
         try:
-            canvas.save(tmp_png, format="PNG", optimize=True)
+            png_canvas.save(tmp_png, format="PNG", optimize=True)
             os.replace(tmp_png, png_path)
         finally:
             try:
@@ -991,17 +1155,31 @@ def render_chunk(chunk_x: int, chunk_y: int, z: int, mode: str):
             "y": chunk_y,
             "z": z,
             "mode": mode,
-            "min_x": min_x,
-            "min_y": min_y,
-            "width": width,
-            "height": height,
+
+            # Fixed-layout metadata.  min_x/min_y are intentionally retained
+            # for compatibility with older viewer code, but are now constant.
+            "min_x": -CHUNK_PNG_ORIGIN_X,
+            "min_y": -CHUNK_PNG_ORIGIN_Y,
+            "origin_x": CHUNK_PNG_ORIGIN_X,
+            "origin_y": CHUNK_PNG_ORIGIN_Y,
+            "width": CHUNK_PNG_WIDTH,
+            "height": CHUNK_PNG_HEIGHT,
+            "display_scale": CHUNK_PNG_DISPLAY_SCALE,
+            "display_width": CHUNK_LOGICAL_WIDTH,
+            "display_height": CHUNK_LOGICAL_HEIGHT,
+            "fixed_size": True,
+            "half_resolution": True,
+            "render_layout": CHUNK_RENDER_CACHE_VERSION,
+
             "drawables": len(drawables),
             "drawn": len(placements),
             "missing_sprite_names": sorted(set(missing)),
+            "clipped_sprite_names": sorted(set(clipped)),
             "image_url": f"/cache/{mode}/z{z}/{png_path.name}",
             "source": src_meta,
             "cache_signature": sig,
         }
+
         tmp_meta = meta_path.with_name(
             meta_path.name + f".tmp-{os.getpid()}-{threading.get_ident()}"
         )
@@ -1017,8 +1195,8 @@ def render_chunk(chunk_x: int, chunk_y: int, z: int, mode: str):
                     tmp_meta.unlink()
             except OSError:
                 pass
-        return out
 
+        return out
 
 def inspect_square(chunk_x: int, chunk_y: int, local_x: int, local_y: int, z: int):
     result = {
@@ -1158,7 +1336,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(st.st_size))
-            self.send_header("Cache-Control", "no-cache")
+
+            # send_file() is called only from the /cache/ route below.
+            self.send_header(
+                "Cache-Control",
+                "public, max-age=31536000, immutable"
+            )
+
             self.end_headers()
 
             remaining = st.st_size
@@ -1185,6 +1369,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/":
                 data = (HERE / "viewer.html").read_bytes()
                 return self.send_bytes(data, "text/html; charset=utf-8")
+
+            if path == "/viewer.js":
+                data = (HERE / "viewer.js").read_bytes()
+                return self.send_bytes(data, "application/javascript; charset=utf-8")
 
             if path == "/api/config":
                 return self.send_json(
