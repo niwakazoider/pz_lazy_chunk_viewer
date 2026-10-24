@@ -1,5 +1,7 @@
 # PZ B42 Lazy Chunk Viewer
 
+<img width="960" height="540" alt="screenshot" src="https://github.com/user-attachments/assets/3ff8b7d5-8669-448d-bf36-1ab53d5742ec" />
+
 Project Zomboid Build 42 の static map / save data を読み込み、8×8 chunk 単位で遅延レンダリングするローカルマップビューアです。
 
 ※ 現在は save の **main sprite のみ**描画し、extra sprites は無効にしています。
