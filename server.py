@@ -83,17 +83,26 @@ def load_config():
         "save_world_version": 249,
         "start_at_player": True,
         "player_username": "",
+        "auto_discover_saves": True,
+        "saves_root": "",
+        "save_root": "",
     }
     for key, value in defaults.items():
         cfg.setdefault(key, value)
 
-    required = ["media_root", "map_root", "save_root", "pack_index_csv"]
+    # save_root is optional when auto_discover_saves is enabled.
+    required = ["media_root", "map_root", "pack_index_csv"]
     missing = [x for x in required if not cfg.get(x)]
     if missing:
         raise SystemExit(f"config.json に不足: {', '.join(missing)}")
 
-    for key in ["media_root", "map_root", "save_root", "pack_index_csv"]:
+    for key in ["media_root", "map_root", "pack_index_csv"]:
         cfg[key] = str(Path(cfg[key]).expanduser().resolve())
+
+    if cfg.get("save_root"):
+        cfg["save_root"] = str(Path(cfg["save_root"]).expanduser().resolve())
+    if cfg.get("saves_root"):
+        cfg["saves_root"] = str(Path(cfg["saves_root"]).expanduser().resolve())
 
     return cfg
 
@@ -722,6 +731,327 @@ def static_chunk_data(chunk_x: int, chunk_y: int):
 _SAVE_SPEC_OBJ = None
 _SAVE_PARSE_CACHE = {}
 _SAVE_LOCK = threading.RLock()
+_SAVE_ROOT_LOCK = threading.RLock()
+_SAVE_DISCOVERY_LOCK = threading.RLock()
+
+# Save discovery can be expensive on large worlds because map/ can contain a
+# very large number of chunk directories/files.  Cache the finished list and
+# only rescan when explicitly requested.
+_SAVE_LIST_CACHE = {
+    "root": None,
+    "world_version": None,
+    "items": None,
+}
+_SAVE_ID_INDEX = {}
+
+
+def _configured_saves_root() -> Path:
+    """Return the folder that contains Sandbox/<save>, Apocalypse/<save>, etc."""
+    raw = str(CFG.get("saves_root") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (Path.home() / "Zomboid" / "Saves").resolve()
+
+
+def _active_save_root() -> Optional[Path]:
+    with _SAVE_ROOT_LOCK:
+        raw = str(CFG.get("save_root") or "").strip()
+    return Path(raw) if raw else None
+
+
+def _read_chunk_world_version(path: Path) -> Optional[int]:
+    """
+    B42 chunk header:
+      byte 0    : header marker/flags
+      bytes 1-4 : big-endian worldVersion
+    Reading only five bytes keeps save discovery cheap.
+    """
+    try:
+        with path.open("rb") as f:
+            head = f.read(5)
+        if len(head) < 5:
+            return None
+        version = int.from_bytes(head[1:5], "big", signed=False)
+        return version if 0 < version < 10000 else None
+    except OSError:
+        return None
+
+
+def _sample_chunk_path(save_dir: Path) -> Optional[Path]:
+    """
+    Find one chunk file as cheaply as possible.
+
+    Do NOT sort directory contents here.  A large explored save can contain
+    thousands of map directories/files, and sorted(iterdir()) forces Windows
+    to enumerate the entire directory before we can inspect even one chunk.
+    We only need one valid chunk header, so return on the first match.
+    """
+    map_dir = save_dir / "map"
+    if map_dir.is_dir():
+        try:
+            with os.scandir(map_dir) as it:
+                for x_entry in it:
+                    if not x_entry.is_dir(follow_symlinks=False):
+                        continue
+                    try:
+                        with os.scandir(x_entry.path) as jt:
+                            for entry in jt:
+                                if (
+                                    entry.is_file(follow_symlinks=False)
+                                    and entry.name.lower().endswith(".bin")
+                                ):
+                                    return Path(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
+    # Alternate numeric-directory layout supported by save_chunk_path().
+    try:
+        with os.scandir(save_dir) as it:
+            for x_entry in it:
+                if not x_entry.is_dir(follow_symlinks=False):
+                    continue
+                if not x_entry.name.lstrip("-").isdigit():
+                    continue
+                try:
+                    with os.scandir(x_entry.path) as jt:
+                        for entry in jt:
+                            if (
+                                entry.is_file(follow_symlinks=False)
+                                and entry.name.lower().endswith(".bin")
+                            ):
+                                return Path(entry.path)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+    # Older/alternate flat layout.
+    try:
+        with os.scandir(save_dir) as it:
+            for entry in it:
+                name = entry.name.lower()
+                if (
+                    entry.is_file(follow_symlinks=False)
+                    and name.startswith("map_")
+                    and name.endswith(".bin")
+                    and name.count("_") >= 2
+                ):
+                    return Path(entry.path)
+    except OSError:
+        pass
+
+    return None
+
+
+def _detect_save_world_version(save_dir: Path) -> tuple[Optional[int], Optional[Path]]:
+    sample = _sample_chunk_path(save_dir)
+    if not sample:
+        return None, None
+    return _read_chunk_world_version(sample), sample
+
+
+def _save_modified_ns(save_dir: Path, sample: Optional[Path]) -> int:
+    values = []
+    for p in (save_dir, save_dir / "players.db", sample):
+        if not p:
+            continue
+        try:
+            values.append(p.stat().st_mtime_ns)
+        except OSError:
+            pass
+    return max(values) if values else 0
+
+
+def _candidate_save_dirs(saves_root: Path):
+    """
+    Yield likely save directories without sorting or recursive traversal.
+
+    Typical layout:
+        Saves/<mode>/<save>
+    """
+    if not saves_root.is_dir():
+        return
+
+    seen = set()
+    try:
+        with os.scandir(saves_root) as it:
+            groups = [entry.path for entry in it if entry.is_dir(follow_symlinks=False)]
+    except OSError:
+        return
+
+    for group_path in groups:
+        group = Path(group_path)
+
+        # Direct save directory.
+        if (group / "map").is_dir() or (group / "players.db").exists():
+            try:
+                r = str(group.resolve())
+            except OSError:
+                r = str(group)
+            if r not in seen:
+                seen.add(r)
+                yield group
+
+        # Normal Saves/<mode>/<save> layout.
+        try:
+            with os.scandir(group) as it:
+                for entry in it:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    save_dir = Path(entry.path)
+                    try:
+                        r = str(save_dir.resolve())
+                    except OSError:
+                        r = str(save_dir)
+                    if r not in seen:
+                        seen.add(r)
+                        yield save_dir
+        except OSError:
+            continue
+
+
+def _save_id(path: Path) -> str:
+    return hashlib.sha1(str(path.resolve()).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def discover_compatible_saves(force=False):
+    """
+    Return saves whose chunk worldVersion matches save_world_version.
+
+    The result is cached in memory.  Normal API calls and save switching do
+    not touch the large map directory tree again.  Pass force=True only for
+    startup's first scan or the UI's explicit "再検索" action.
+    """
+    global _SAVE_ID_INDEX
+
+    saves_root = _configured_saves_root()
+    target_version = int(CFG["save_world_version"])
+    cache_root = str(saves_root)
+    cache_version = target_version
+
+    with _SAVE_DISCOVERY_LOCK:
+        if (
+            not force
+            and _SAVE_LIST_CACHE["items"] is not None
+            and _SAVE_LIST_CACHE["root"] == cache_root
+            and _SAVE_LIST_CACHE["world_version"] == cache_version
+        ):
+            return [dict(x) for x in _SAVE_LIST_CACHE["items"]]
+
+        items = []
+        for save_dir in _candidate_save_dirs(saves_root) or ():
+            version, sample = _detect_save_world_version(save_dir)
+            if version != target_version:
+                continue
+
+            try:
+                rel = save_dir.resolve().relative_to(saves_root.resolve())
+                parts = rel.parts
+                group = parts[0] if len(parts) > 1 else ""
+            except (OSError, ValueError):
+                group = save_dir.parent.name
+
+            items.append(
+                {
+                    "id": _save_id(save_dir),
+                    "name": save_dir.name,
+                    "group": group,
+                    "label": f"{group} / {save_dir.name}" if group else save_dir.name,
+                    "path": str(save_dir.resolve()),
+                    "world_version": version,
+                    "modified_ns": _save_modified_ns(save_dir, sample),
+                }
+            )
+
+        # Sorting a few save records is cheap; the expensive map directories
+        # were intentionally never sorted.
+        items.sort(key=lambda x: (-x["modified_ns"], x["label"].lower()))
+
+        _SAVE_LIST_CACHE["root"] = cache_root
+        _SAVE_LIST_CACHE["world_version"] = cache_version
+        _SAVE_LIST_CACHE["items"] = [dict(x) for x in items]
+        _SAVE_ID_INDEX = {x["id"]: dict(x) for x in items}
+
+        print(
+            f"[save] discovery complete: {len(items)} compatible save(s) "
+            f"under {saves_root}"
+        )
+        return [dict(x) for x in items]
+
+
+def _current_save_descriptor():
+    root = _active_save_root()
+    if not root or not root.is_dir():
+        return None
+    version, sample = _detect_save_world_version(root)
+    return {
+        "id": _save_id(root),
+        "name": root.name,
+        "group": root.parent.name,
+        "label": f"{root.parent.name} / {root.name}",
+        "path": str(root.resolve()),
+        "world_version": version,
+        "modified_ns": _save_modified_ns(root, sample),
+    }
+
+
+def _reset_save_caches():
+    with _SAVE_LOCK:
+        _SAVE_PARSE_CACHE.clear()
+    with _PLAYER_LOCK:
+        _PLAYER_CACHE["sig"] = None
+        _PLAYER_CACHE["value"] = None
+
+
+def _set_active_save_root(path: Path):
+    resolved = path.expanduser().resolve()
+    with _SAVE_ROOT_LOCK:
+        CFG["save_root"] = str(resolved)
+    _reset_save_caches()
+
+
+def select_save_by_id(save_id: str):
+    with _SAVE_DISCOVERY_LOCK:
+        item = _SAVE_ID_INDEX.get(save_id)
+
+    # The server may have been started with discovery disabled and the first
+    # request can arrive before any list has been built.  Build it once only.
+    if item is None and _SAVE_LIST_CACHE["items"] is None:
+        discover_compatible_saves(force=True)
+        with _SAVE_DISCOVERY_LOCK:
+            item = _SAVE_ID_INDEX.get(save_id)
+
+    if item is None:
+        raise ValueError("選択されたセーブが見つからないか、再検索が必要です")
+
+    item = dict(item)
+    _set_active_save_root(Path(item["path"]))
+    return item
+
+
+def _ensure_initial_save_selected():
+    target_version = int(CFG["save_world_version"])
+    current = _active_save_root()
+
+    if current and current.is_dir():
+        version, _ = _detect_save_world_version(current)
+        if version == target_version:
+            return
+
+    if not CFG.get("auto_discover_saves", True):
+        return
+
+    saves = discover_compatible_saves(force=True)
+    if saves:
+        _set_active_save_root(Path(saves[0]["path"]))
+        print(f"[save] auto-selected: {saves[0]['label']}")
+    else:
+        print(
+            f"[save] compatible save not found: "
+            f"{_configured_saves_root()} worldVersion={target_version}"
+        )
 
 
 CLASS_NAMES = {
@@ -735,7 +1065,9 @@ CLASS_NAMES = {
 
 
 def save_chunk_path(chunk_x: int, chunk_y: int):
-    root = Path(CFG["save_root"])
+    root = _active_save_root()
+    if root is None:
+        return None
     candidates = [
         root / "map" / str(chunk_x) / f"{chunk_y}.bin",
         root / str(chunk_x) / f"{chunk_y}.bin",
@@ -843,7 +1175,8 @@ def parse_save_chunk(chunk_x: int, chunk_y: int):
         return None, None
 
     st = path.stat()
-    key = (chunk_x, chunk_y, st.st_mtime_ns, st.st_size)
+    save_path_key = str(path.resolve())
+    key = (save_path_key, chunk_x, chunk_y, st.st_mtime_ns, st.st_size)
 
     with _SAVE_LOCK:
         if key in _SAVE_PARSE_CACHE:
@@ -921,9 +1254,9 @@ def parse_save_chunk(chunk_x: int, chunk_y: int):
             "crc": int(c.crc),
         }
 
-        # Keep only current version for each chunk.
+        # Keep only the current file version for this chunk in this save.
         for old in list(_SAVE_PARSE_CACHE):
-            if old[:2] == (chunk_x, chunk_y):
+            if old[0] == save_path_key and old[1:3] == (chunk_x, chunk_y):
                 del _SAVE_PARSE_CACHE[old]
         _SAVE_PARSE_CACHE[key] = (squares, meta)
         return squares, meta
@@ -1236,7 +1569,10 @@ _PLAYER_CACHE = {"sig": None, "value": None}
 _PLAYER_LOCK = threading.RLock()
 
 def _players_db_path():
-    p = Path(CFG["save_root"]) / "players.db"
+    root = _active_save_root()
+    if root is None:
+        return None
+    p = root / "players.db"
     return p if p.exists() else None
 
 def _quote_ident(name: str):
@@ -1322,7 +1658,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # Browser navigated away / cancelled a stale request.
+            return
 
     def send_file(self, path: Path, content_type: str):
         """Stream a stable opened file with an exact Content-Length."""
@@ -1355,10 +1695,23 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
-            self.wfile.flush()
+            try:
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                return
 
     def send_json(self, obj, status=200):
         self.send_bytes(json_bytes(obj), "application/json; charset=utf-8", status)
+
+    def read_json_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("bad Content-Length")
+        if length < 0 or length > 1024 * 1024:
+            raise ValueError("request body too large")
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8"))
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -1382,9 +1735,23 @@ class Handler(BaseHTTPRequestHandler):
                         "start_z": CFG["start_z"],
                         "prefetch_radius": CFG["prefetch_radius"],
                         "max_request_radius": CFG["max_request_radius"],
+                        "save_world_version": CFG["save_world_version"],
+                        "saves_root": str(_configured_saves_root()),
                         "extra_sprites": False,
                         "lazy_map_lookup": True,
+                        "current_save": _current_save_descriptor(),
                         "player": _find_player_position(),
+                    }
+                )
+
+            if path == "/api/saves":
+                refresh = q.get("refresh", ["0"])[0] in ("1", "true", "yes")
+                return self.send_json(
+                    {
+                        "world_version": int(CFG["save_world_version"]),
+                        "saves_root": str(_configured_saves_root()),
+                        "current": _current_save_descriptor(),
+                        "saves": discover_compatible_saves(force=refresh),
                     }
                 )
 
@@ -1436,8 +1803,46 @@ class Handler(BaseHTTPRequestHandler):
                 500,
             )
 
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        try:
+            if path == "/api/select-save":
+                body = self.read_json_body()
+                save_id = str(body.get("id") or "").strip()
+                if not save_id:
+                    raise ValueError("save id is required")
+
+                selected = select_save_by_id(save_id)
+                return self.send_json(
+                    {
+                        "ok": True,
+                        "selected": selected,
+                        "current": _current_save_descriptor(),
+                        "player": _find_player_position(),
+                    }
+                )
+
+            return self.send_json({"error": "not found"}, 404)
+
+        except ValueError as e:
+            return self.send_json(
+                {"error": type(e).__name__, "message": str(e)},
+                400,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return self.send_json(
+                {"error": type(e).__name__, "message": str(e)},
+                500,
+            )
+
 
 def main():
+    _ensure_initial_save_selected()
+
     host = CFG["host"]
     port = int(CFG["port"])
     server = ThreadingHTTPServer((host, port), Handler)
